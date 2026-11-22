@@ -1,0 +1,463 @@
+#!/usr/bin/env bash
+# ghrepo: copy, archive, transfer and rename GitHub repositories with the gh CLI.
+# Source and docs: https://github.com/vulrun/repo-tools
+
+if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
+  echo "Error: ghrepo needs bash 4 or newer. On macOS run: brew install bash" >&2
+  exit 1
+fi
+
+set -euo pipefail
+
+PROG="$(basename "$0")"
+VERSION="1.5.0"
+
+# ---------- help text ----------
+
+usage_main() {
+cat <<EOF
+$PROG $VERSION
+Copy, archive, transfer and rename GitHub repositories.
+
+USAGE
+  $PROG <command> [arguments]
+  $PROG <command> --help
+
+COMMANDS
+  copy       Copy repos (all branches, tags and history) into another org.
+             The originals stay where they are. Safe to re-run.
+  archive    Make repos read-only.
+  transfer   Move repos to another org. The old location is gone.
+  rename     Rename a repo inside its org.
+
+SEVERAL REPOS AT ONCE
+  copy, archive and transfer take any number of repos:
+    old-org/website old-org/api       separate arguments
+    old-org/{website,api,docs}        shell braces (no spaces inside)
+    "old-org/website,api,docs"        comma list in quotes
+
+OPTIONS
+  -h, --help       Show this help
+  -v, --version    Show the version
+
+SETUP
+  Needs bash 4+, git and gh. Sign in once:
+    gh auth login
+    gh auth refresh -h github.com -s workflow
+  git uses your gh login, so there's no username or password prompt.
+
+EXAMPLES
+  $PROG copy     old-org/website new-org
+  $PROG copy     old-org/website new-org/website-v2
+  $PROG copy     old-org/{website,api,docs} new-org
+  $PROG archive  archive-org/{website,old-api}
+  $PROG transfer old-org/{website,api} archive-org
+  $PROG rename   new-org/website website-v2
+
+Run "$PROG <command> --help" for details on each command.
+EOF
+}
+
+usage_copy() {
+cat <<EOF
+$PROG copy: copy repositories into another organization
+
+USAGE
+  $PROG copy <source-org/repo> [<source-org/repo> ...] <destination>
+
+ARGUMENTS
+  source-org/repo    One or more repos to copy. Braces and comma lists work:
+                     old-org/{website,api} or "old-org/website,api"
+  destination        The last argument. Either:
+                       an org name      each copy keeps its source name
+                       org/new-name     renamed copy (ONE source only)
+
+WHAT IT DOES
+  1. Creates the destination repo with the source's visibility (private,
+     internal or public), or reuses it if it exists and is empty.
+  2. Pushes every branch and tag with full commit history.
+
+RE-RUNNING AND RESUMING
+  If the destination already holds an earlier or partial copy of the
+  source, copy pushes only what is missing or newer. It never
+  force-pushes, so no commit in the destination is ever lost.
+  A destination with commits that aren't in the source is skipped.
+
+NOT COPIED
+  Issues, pull requests, Actions secrets and variables, branch protection,
+  webhooks, wiki, releases and Git LFS files.
+
+GITHUB ACTIONS
+  Pushing branches counts as a push event, so workflows with a push
+  trigger start in the destination. To stop that, turn Actions off for
+  the destination org first, and back on when the workflows are ready:
+    gh api -X PUT orgs/<org>/actions/permissions -f enabled_repositories=none
+    gh api -X PUT orgs/<org>/actions/permissions -f enabled_repositories=all
+
+NEEDS
+  The workflow scope on your gh login, or GitHub rejects branches that
+  contain .github/workflows files. copy checks this before starting:
+    gh auth refresh -h github.com -s workflow
+
+EXAMPLES
+  $PROG copy old-org/website new-org
+      creates new-org/website
+  $PROG copy old-org/website new-org/website-v2
+      creates new-org/website-v2
+  $PROG copy old-org/{website,api,docs} new-org
+      creates new-org/website, new-org/api and new-org/docs
+EOF
+}
+
+usage_archive() {
+cat <<EOF
+$PROG archive: archive one or more repositories
+
+USAGE
+  $PROG archive <org/repo> [<org/repo> ...]
+
+ARGUMENTS
+  org/repo    One or more repos to archive. Braces and comma lists work:
+              archive-org/{website,api} or "archive-org/website,api"
+
+WHAT IT DOES
+  Marks each repo as archived: read-only, no pushes, issues or PRs.
+  An owner can unarchive it later in the repo's Settings.
+
+SAFETY
+  Skips any repo that doesn't exist or is already archived, and carries
+  on with the rest.
+
+EXAMPLES
+  $PROG archive archive-org/website
+  $PROG archive archive-org/{website,old-api,docs}
+EOF
+}
+
+usage_transfer() {
+cat <<EOF
+$PROG transfer: move repositories to another organization
+
+USAGE
+  $PROG transfer <source-org/repo> [<source-org/repo> ...] <destination-org>
+
+ARGUMENTS
+  source-org/repo    One or more repos to move. Braces and comma lists work:
+                     old-org/{website,api} or "old-org/website,api"
+  destination-org    The last argument. Org name only, no repo name.
+                     Each repo keeps its name.
+
+WHAT IT DOES
+  Moves each repo with its issues, PRs, stars and settings. GitHub
+  redirects the old URL to the new one.
+
+WARNING
+  This is a move, not a copy. Run "copy" first if the code should also
+  stay where it is. If you later create a repo with the same name in the
+  old org, the redirect stops working.
+
+PERMISSIONS
+  You must be able to create repos in the destination org.
+
+EXAMPLES
+  $PROG transfer old-org/website archive-org
+      moves it to archive-org/website
+  $PROG transfer old-org/{website,api,docs} archive-org
+      moves all three to archive-org
+EOF
+}
+
+usage_rename() {
+cat <<EOF
+$PROG rename: rename a repository inside its organization
+
+USAGE
+  $PROG rename <org/repo> <new-name>
+
+ARGUMENTS
+  org/repo    The repo to rename, for example new-org/website
+  new-name    The new name only, no org. Letters, digits, dot, dash, underscore.
+
+WHAT IT DOES
+  Renames the repo. Issues, PRs, stars and settings stay. GitHub redirects
+  the old name to the new one for web links, clones and pushes.
+
+AFTERWARDS
+  Point local clones at the new name:
+    git remote set-url origin https://github.com/<org>/<new-name>.git
+  If you later create a repo with the old name, the redirect stops working.
+  To move a repo to another org, use "transfer".
+
+SAFETY
+  Stops if the repo doesn't exist or the new name is already taken.
+
+EXAMPLES
+  $PROG rename new-org/website website-v2
+      new-org/website becomes new-org/website-v2
+EOF
+}
+
+# ---------- helpers ----------
+
+die()  { echo "Error: $*" >&2; exit 1; }
+info() { echo "==> $*"; }
+skip() { echo "    skip: $*"; }
+fail() { echo "    FAILED: $*" >&2; }
+
+wants_help() {
+  local a
+  for a in "$@"; do [[ "$a" == "-h" || "$a" == "--help" ]] && return 0; done
+  return 1
+}
+
+check_tools() {
+  command -v gh  >/dev/null 2>&1 || die "gh is not installed. See https://cli.github.com"
+  command -v git >/dev/null 2>&1 || die "git is not installed."
+  gh auth status >/dev/null 2>&1 || die "not signed in. Run: gh auth login"
+}
+
+# Stops early if the token lists its scopes and workflow isn't one of them.
+# Tokens that don't list scopes (fine-grained PATs) pass through.
+need_workflow_scope() {
+  local status
+  status=$(gh auth status -h github.com 2>&1) || true
+  if grep -q "Token scopes:" <<< "$status" && ! grep -q "'workflow'" <<< "$status"; then
+    die "your gh login is missing the workflow scope, so GitHub would reject
+       branches that contain .github/workflows files. Run this, then retry:
+         gh auth refresh -h github.com -s workflow"
+  fi
+}
+
+# git with the gh login for github.com and no password prompt.
+# The empty helper first clears any other helper, like a stored password.
+ghgit() {
+  GIT_TERMINAL_PROMPT=0 git \
+    -c credential.https://github.com.helper= \
+    -c credential.https://github.com.helper='!gh auth git-credential' \
+    "$@"
+}
+
+is_slug() { [[ "$1" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]]; }
+is_name() { [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]]; }
+is_org()  { [[ "$1" =~ ^[A-Za-z0-9-]+$ ]]; }
+
+need_org() {
+  is_org "$1" || die "'$1' must be an org name only, for example archive-org"
+}
+
+repo_exists() { gh repo view "$1" >/dev/null 2>&1; }
+
+# Prints "missing", "empty" or "has-data" for a repo.
+repo_state() {
+  local empty
+  if ! empty=$(gh repo view "$1" --json isEmpty --jq '.isEmpty' 2>/dev/null); then
+    echo missing
+  elif [ "$empty" = "true" ]; then
+    echo empty
+  else
+    echo has-data
+  fi
+}
+
+# True when every branch and tag in the target points to a commit that
+# also exists in the source mirror at $1. The target is then an earlier or
+# partial copy of the source, so pushing into it is safe.
+is_partial_copy() {
+  local dir="$1" target="$2" refs sha rest
+  refs=$(ghgit ls-remote --heads --tags "https://github.com/$target.git") || return 1
+  while read -r sha rest; do
+    [ -n "$sha" ] || continue
+    git -C "$dir" cat-file -e "${sha}^{commit}" 2>/dev/null || return 1
+  done <<< "$refs"
+}
+
+# Turns "org/a,b,c" or "org/{a,b,c}" into org/a org/b org/c, one per line.
+# Anything without a slash is passed through so the caller can report it.
+expand_sources() {
+  local s org list item
+  local -a parts
+  for s in "$@"; do
+    if [[ "$s" != */* ]]; then echo "$s"; continue; fi
+    org="${s%%/*}"
+    list="${s#*/}"
+    list="${list#\{}"
+    list="${list%\}}"
+    IFS=',' read -ra parts <<< "$list"
+    for item in "${parts[@]}"; do
+      item="${item// /}"
+      [ -n "$item" ] && echo "$org/$item"
+    done
+  done
+}
+
+# ---------- commands ----------
+
+cmd_copy() {
+  wants_help "$@" && { usage_copy; exit 0; }
+  [ "$#" -ge 2 ] || { usage_copy >&2; exit 1; }
+  check_tools
+  need_workflow_scope
+
+  local dst="${!#}"
+  local -a sources
+  mapfile -t sources < <(expand_sources "${@:1:$#-1}")
+  [ "${#sources[@]}" -gt 0 ] || die "no source repos given"
+
+  if [[ "$dst" == */* ]]; then
+    is_slug "$dst" || die "'$dst' must look like org or org/repo"
+    [ "${#sources[@]}" -eq 1 ] \
+      || die "with several sources, give an org name only as the destination"
+  else
+    need_org "$dst"
+  fi
+
+  local src target vis state tmp ok=0 skipped=0 failed=0
+  for src in "${sources[@]}"; do
+    if ! is_slug "$src"; then skip "'$src' is not a valid org/repo"; skipped=$((skipped+1)); continue; fi
+    if [[ "$dst" == */* ]]; then target="$dst"; else target="$dst/${src#*/}"; fi
+    if [ "$src" = "$target" ]; then skip "$src: source and destination are the same"; skipped=$((skipped+1)); continue; fi
+
+    if ! vis=$(gh repo view "$src" --json visibility --jq '.visibility' 2>/dev/null); then
+      skip "$src not found, or no access"; skipped=$((skipped+1)); continue
+    fi
+    vis="${vis,,}"
+
+    tmp=$(mktemp -d)
+    if ! ghgit clone --quiet --mirror "https://github.com/$src.git" "$tmp/repo.git"; then
+      fail "could not clone $src"; failed=$((failed+1)); rm -rf "$tmp"; continue
+    fi
+
+    state=$(repo_state "$target")
+    case "$state" in
+      missing)
+        info "Copying $src to $target (new $vis repo)"
+        if ! gh repo create "$target" "--$vis" --disable-wiki >/dev/null; then
+          fail "could not create $target"; failed=$((failed+1)); rm -rf "$tmp"; continue
+        fi ;;
+      empty)
+        info "Copying $src to $target (reusing existing empty repo)" ;;
+      has-data)
+        if is_partial_copy "$tmp/repo.git" "$target"; then
+          info "Resuming $src to $target (it holds an earlier or partial copy)"
+        else
+          skip "$target has commits that aren't in $src; not touching it"
+          skipped=$((skipped+1)); rm -rf "$tmp"; continue
+        fi ;;
+    esac
+
+    if ghgit -C "$tmp/repo.git" push --quiet "https://github.com/$target.git" \
+         'refs/heads/*:refs/heads/*' 'refs/tags/*:refs/tags/*'; then
+      ok=$((ok+1))
+    else
+      fail "$src: push failed. Fix the error above, then re-run to resume."
+      failed=$((failed+1))
+    fi
+    rm -rf "$tmp"
+  done
+  info "Finished: $ok copied, $skipped skipped, $failed failed"
+  [ "$failed" -eq 0 ]
+}
+
+cmd_archive() {
+  wants_help "$@" && { usage_archive; exit 0; }
+  [ "$#" -ge 1 ] || { usage_archive >&2; exit 1; }
+  check_tools
+
+  local -a repos
+  mapfile -t repos < <(expand_sources "$@")
+
+  local r archived ok=0 skipped=0 failed=0
+  for r in "${repos[@]}"; do
+    if ! is_slug "$r"; then skip "'$r' is not a valid org/repo"; skipped=$((skipped+1)); continue; fi
+    if ! archived=$(gh repo view "$r" --json isArchived --jq '.isArchived' 2>/dev/null); then
+      skip "$r not found, or no access"; skipped=$((skipped+1)); continue
+    fi
+    if [ "$archived" = "true" ]; then skip "$r is already archived"; skipped=$((skipped+1)); continue; fi
+
+    if gh repo archive "$r" --yes >/dev/null; then
+      info "Archived $r"; ok=$((ok+1))
+    else
+      fail "could not archive $r"; failed=$((failed+1))
+    fi
+  done
+  info "Finished: $ok archived, $skipped skipped, $failed failed"
+  [ "$failed" -eq 0 ]
+}
+
+cmd_transfer() {
+  wants_help "$@" && { usage_transfer; exit 0; }
+  [ "$#" -ge 2 ] || { usage_transfer >&2; exit 1; }
+  check_tools
+
+  local dst_org="${!#}"
+  need_org "$dst_org"
+
+  local -a sources
+  mapfile -t sources < <(expand_sources "${@:1:$#-1}")
+
+  local src name ok=0 skipped=0 failed=0 arrived _
+  for src in "${sources[@]}"; do
+    if ! is_slug "$src"; then skip "'$src' is not a valid org/repo"; skipped=$((skipped+1)); continue; fi
+    name="${src#*/}"
+    if [ "${src%%/*}" = "$dst_org" ]; then skip "$src is already in $dst_org"; skipped=$((skipped+1)); continue; fi
+    if ! repo_exists "$src"; then skip "$src not found, or no access"; skipped=$((skipped+1)); continue; fi
+    if repo_exists "$dst_org/$name"; then skip "$dst_org/$name already exists"; skipped=$((skipped+1)); continue; fi
+
+    info "Transferring $src to $dst_org"
+    if ! gh api -X POST "repos/$src/transfer" -f new_owner="$dst_org" >/dev/null; then
+      fail "could not transfer $src"; failed=$((failed+1)); continue
+    fi
+
+    # GitHub finishes transfers in the background; wait up to a minute.
+    arrived=0
+    for _ in $(seq 1 30); do
+      if repo_exists "$dst_org/$name"; then arrived=1; break; fi
+      sleep 2
+    done
+    if [ "$arrived" -eq 1 ]; then
+      info "Now at $dst_org/$name"
+    else
+      info "Started; GitHub is still processing $dst_org/$name"
+    fi
+    ok=$((ok+1))
+  done
+  info "Finished: $ok transferred, $skipped skipped, $failed failed"
+  [ "$failed" -eq 0 ]
+}
+
+cmd_rename() {
+  wants_help "$@" && { usage_rename; exit 0; }
+  [ "$#" -eq 2 ] || { usage_rename >&2; exit 1; }
+  check_tools
+
+  local src="$1" new="$2"
+  is_slug "$src" || die "'$src' must look like org/repo"
+  [[ "$new" != */* ]] || die "new name only, no org. To change org, use transfer."
+  is_name "$new" || die "'$new' can use only letters, digits, dot, dash, underscore"
+
+  local org="${src%%/*}" old="${src#*/}"
+  [ "$old" != "$new" ] || die "new name is the same as the old one"
+
+  repo_exists "$src" || die "$src not found, or you don't have access"
+  repo_exists "$org/$new" && die "$org/$new already exists. Nothing changed."
+
+  info "Renaming $src to $org/$new"
+  gh api -X PATCH "repos/$src" -f name="$new" >/dev/null || die "rename failed"
+  info "Done: now at $org/$new"
+  echo "    Update local clones: git remote set-url origin https://github.com/$org/$new.git"
+}
+
+# ---------- entry point ----------
+
+sub="${1:-}"
+[ "$#" -gt 0 ] && shift
+
+case "$sub" in
+  copy)          cmd_copy "$@" ;;
+  archive)       cmd_archive "$@" ;;
+  transfer)      cmd_transfer "$@" ;;
+  rename)        cmd_rename "$@" ;;
+  -h|--help|"")  usage_main ;;
+  -v|--version)  echo "$PROG $VERSION" ;;
+  *)             echo "Unknown command: $sub" >&2; echo >&2; usage_main >&2; exit 1 ;;
+esac

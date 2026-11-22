@@ -1,0 +1,2 @@
+# Keep LF line endings so the scripts run on every OS, even after a Windows checkout.
+* text=auto eol=lf

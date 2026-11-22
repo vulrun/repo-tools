@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+# Fake gh for the tests. Only the calls ghrepo makes are supported.
+# Repos are bare repos at $STUB_STATE/github/<owner>/<name>.git, with
+# metadata in <name>.meta. An owner exists when its folder exists.
+# STUB_GH_SCOPES sets what "gh auth status" reports as token scopes.
+set -euo pipefail
+
+S="$STUB_STATE/github"
+repo_dir()  { echo "$S/$1.git"; }
+meta_file() { echo "$S/$1.meta"; }
+get_meta()  { sed -n "s/^$2=//p" "$(meta_file "$1")"; }
+set_meta() {
+  local f; f="$(meta_file "$1")"
+  { grep -v "^$2=" "$f" || true; echo "$2=$3"; } > "$f.tmp"
+  mv "$f.tmp" "$f"
+}
+need_repo() {
+  [ -d "$(repo_dir "$1")" ] || { echo "GraphQL: Could not resolve to a Repository ($1)" >&2; exit 1; }
+}
+move_repo() {   # move_repo <from> <to>
+  [ -d "$S/${2%%/*}" ] || { echo "stub: owner ${2%%/*} not found" >&2; exit 1; }
+  [ ! -e "$(repo_dir "$2")" ] || { echo "stub: $2 already exists" >&2; exit 1; }
+  mv "$(repo_dir "$1")" "$(repo_dir "$2")"
+  mv "$(meta_file "$1")" "$(meta_file "$2")"
+}
+
+echo "gh $*" >> "$STUB_STATE/calls.log"
+
+case "${1:-} ${2:-}" in
+  "auth status")
+    echo "github.com"
+    echo "  - Logged in to github.com account tester"
+    echo "  - Token scopes: ${STUB_GH_SCOPES-'gist', 'read:org', 'repo', 'workflow'}"
+    ;;
+
+  "auth git-credential")
+    cat > /dev/null
+    if [ "${3:-}" = get ]; then
+      echo "username=x-access-token"
+      echo "password=gho_stubtoken"
+    fi
+    ;;
+
+  "repo view")
+    r="$3"; shift 3
+    need_repo "$r"
+    field=""
+    while [ $# -gt 0 ]; do
+      case "$1" in --json) field="$2"; shift 2 ;; *) shift ;; esac
+    done
+    case "$field" in
+      "")         ;;
+      visibility) get_meta "$r" vis ;;
+      isArchived) get_meta "$r" archived ;;
+      isEmpty)
+        if [ -z "$(git -C "$(repo_dir "$r")" for-each-ref)" ]; then echo true; else echo false; fi ;;
+      *) echo "stub: unsupported field $field" >&2; exit 2 ;;
+    esac
+    ;;
+
+  "repo create")
+    r="$3"; vis=""
+    for a in "$@"; do
+      case "$a" in --private) vis=PRIVATE ;; --public) vis=PUBLIC ;; --internal) vis=INTERNAL ;; esac
+    done
+    [ -d "$S/${r%%/*}" ] || { echo "stub: owner ${r%%/*} not found" >&2; exit 1; }
+    [ ! -e "$(repo_dir "$r")" ] || { echo "stub: $r already exists" >&2; exit 1; }
+    git init -q --bare "$(repo_dir "$r")"
+    printf 'vis=%s\narchived=false\n' "$vis" > "$(meta_file "$r")"
+    echo "https://github.com/$r"
+    ;;
+
+  "repo archive")
+    need_repo "$3"
+    set_meta "$3" archived true
+    ;;
+
+  "api -X")
+    method="$3"; path="$4"; shift 4
+    new_owner=""; new_name=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -f) case "$2" in new_owner=*) new_owner="${2#*=}" ;; name=*) new_name="${2#*=}" ;; esac; shift 2 ;;
+        *)  shift ;;
+      esac
+    done
+    case "$method $path" in
+      "POST repos/"*/transfer)
+        r="${path#repos/}"; r="${r%/transfer}"
+        need_repo "$r"
+        move_repo "$r" "$new_owner/${r#*/}"
+        ;;
+      "PATCH repos/"*)
+        r="${path#repos/}"
+        need_repo "$r"
+        move_repo "$r" "${r%%/*}/$new_name"
+        ;;
+      *) echo "stub: unsupported api call $method $path" >&2; exit 2 ;;
+    esac
+    ;;
+
+  *)
+    echo "stub: unsupported gh call: $*" >&2
+    exit 2
+    ;;
+esac

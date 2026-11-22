@@ -1,0 +1,472 @@
+#!/usr/bin/env bash
+# glrepo: copy, archive, transfer and rename GitLab projects with the glab CLI.
+# Source and docs: https://github.com/vulrun/repo-tools
+
+if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
+  echo "Error: glrepo needs bash 4 or newer. On macOS run: brew install bash" >&2
+  exit 1
+fi
+
+set -euo pipefail
+
+PROG="$(basename "$0")"
+VERSION="1.0.0"
+
+GL_HOST="${GL_HOST:-${GITLAB_HOST:-gitlab.com}}"
+GL_HOST="${GL_HOST#*://}"
+GL_HOST="${GL_HOST%/}"
+GLREPO_TOKEN=""
+
+# ---------- help text ----------
+
+usage_main() {
+cat <<EOF
+$PROG $VERSION
+Copy, archive, transfer and rename GitLab projects.
+
+USAGE
+  $PROG <command> [arguments]
+  $PROG <command> --help
+
+COMMANDS
+  copy       Copy projects (all branches, tags and history) into another
+             group. The originals stay where they are. Safe to re-run.
+  archive    Make projects read-only.
+  transfer   Move projects to another group. The old location is gone.
+  rename     Rename a project inside its group.
+
+SEVERAL PROJECTS AT ONCE
+  copy, archive and transfer take any number of projects:
+    old-group/website old-group/api     separate arguments
+    old-group/{website,api,docs}        shell braces (no spaces inside)
+    "old-group/website,api,docs"        comma list in quotes
+  Subgroups work everywhere: udooh/backend/{api,worker}
+
+OPTIONS
+  -h, --help       Show this help
+  -v, --version    Show the version
+
+SETUP
+  Needs bash 4+, git, glab and jq. Sign in once:
+    glab auth login        (token scopes: api, write_repository)
+  Self-hosted GitLab: GL_HOST=gitlab.example.com $PROG ...
+  Current host: $GL_HOST
+
+EXAMPLES
+  $PROG copy     old-group/website new-group
+  $PROG copy     old-group/website new-group/website-v2
+  $PROG copy     old-group/{website,api} new-group/backend
+  $PROG archive  archive-group/{website,old-api}
+  $PROG transfer old-group/{website,api} archive-group
+  $PROG rename   new-group/website website-v2
+
+Run "$PROG <command> --help" for details on each command.
+EOF
+}
+
+usage_copy() {
+cat <<EOF
+$PROG copy: copy projects into another group
+
+USAGE
+  $PROG copy <group/project> [<group/project> ...] <destination>
+
+ARGUMENTS
+  group/project   One or more projects to copy. Subgroups, braces and comma
+                  lists work: old-group/backend/{api,worker}
+  destination     The last argument. Either:
+                    an existing group, subgroup or user namespace
+                        each copy keeps its source name
+                    anything else, like new-group/website-v2
+                        the last part is the new name (ONE source only)
+
+WHAT IT DOES
+  1. Creates the project with the source's visibility, or reuses it if it
+     exists and is empty.
+  2. Pushes every branch and tag with full history. The push carries the
+     ci.skip option, so GitLab doesn't start pipelines for copied branches.
+
+RE-RUNNING AND RESUMING
+  If the destination already holds an earlier or partial copy of the
+  source, copy pushes only what is missing or newer. It never
+  force-pushes, so no commit in the destination is ever lost.
+  A destination with commits that aren't in the source is skipped.
+
+NOT COPIED
+  Issues, merge requests, CI/CD variables, protected branch rules,
+  webhooks, wiki, releases and Git LFS files.
+
+TOKEN
+  git uses GITLAB_TOKEN if it's set, otherwise the token glab saved at
+  login. It's handed to git for this command only, never written to disk.
+
+EXAMPLES
+  $PROG copy old-group/website new-group
+      creates new-group/website
+  $PROG copy old-group/website new-group/website-v2
+      creates new-group/website-v2
+  $PROG copy old-group/{website,api} new-group/backend
+      creates new-group/backend/website and new-group/backend/api
+EOF
+}
+
+usage_archive() {
+cat <<EOF
+$PROG archive: archive one or more projects
+
+USAGE
+  $PROG archive <group/project> [<group/project> ...]
+
+ARGUMENTS
+  group/project   One or more projects to archive. Braces and comma lists
+                  work: archive-group/{website,api}
+
+WHAT IT DOES
+  Marks each project as archived (read-only). Unarchive later in the
+  project's Settings > General > Advanced.
+
+SAFETY
+  Skips any project that doesn't exist or is already archived, and
+  carries on with the rest.
+
+EXAMPLES
+  $PROG archive archive-group/website
+  $PROG archive archive-group/{website,old-api,docs}
+EOF
+}
+
+usage_transfer() {
+cat <<EOF
+$PROG transfer: move projects to another group
+
+USAGE
+  $PROG transfer <group/project> [<group/project> ...] <destination-group>
+
+ARGUMENTS
+  group/project       One or more projects to move. Braces and comma lists
+                      work: old-group/{website,api}
+  destination-group   The last argument. A group or subgroup path, no
+                      project name. Each project keeps its name.
+
+WHAT IT DOES
+  Moves each project with its issues, merge requests and settings.
+  GitLab redirects the old path to the new one.
+
+WARNING
+  This is a move, not a copy. Run "copy" first if the code should also
+  stay where it is.
+
+PERMISSIONS
+  You need the Owner role on each project and at least Maintainer on the
+  destination group.
+
+EXAMPLES
+  $PROG transfer old-group/website archive-group
+      moves it to archive-group/website
+  $PROG transfer old-group/{website,api} archive-group/legacy
+      moves both into the legacy subgroup
+EOF
+}
+
+usage_rename() {
+cat <<EOF
+$PROG rename: rename a project inside its group
+
+USAGE
+  $PROG rename <group/project> <new-name>
+
+ARGUMENTS
+  group/project   The project to rename, for example new-group/website
+  new-name        The new name only, no group. Letters, digits, dot, dash,
+                  underscore.
+
+WHAT IT DOES
+  Changes both the display name and the URL path. GitLab redirects the
+  old path to the new one.
+
+AFTERWARDS
+  Point local clones at the new path:
+    git remote set-url origin https://$GL_HOST/<group>/<new-name>.git
+  To move a project to another group, use "transfer".
+
+SAFETY
+  Stops if the project doesn't exist or the new name is already taken.
+
+EXAMPLES
+  $PROG rename new-group/website website-v2
+      new-group/website becomes new-group/website-v2
+EOF
+}
+
+# ---------- helpers ----------
+
+die()  { echo "Error: $*" >&2; exit 1; }
+info() { echo "==> $*"; }
+skip() { echo "    skip: $*"; }
+fail() { echo "    FAILED: $*" >&2; }
+
+urlenc() { jq -rn --arg s "$1" '$s|@uri'; }
+gl_api() { glab api --hostname "$GL_HOST" "$@"; }
+
+wants_help() {
+  local a
+  for a in "$@"; do [[ "$a" == "-h" || "$a" == "--help" ]] && return 0; done
+  return 1
+}
+
+check_tools() {
+  local t
+  for t in glab git jq; do
+    command -v "$t" >/dev/null 2>&1 || die "$t is not installed"
+  done
+  glab auth status --hostname "$GL_HOST" >/dev/null 2>&1 \
+    || die "not signed in to $GL_HOST. Run: glab auth login"
+}
+
+# Prints the GitLab token: GITLAB_TOKEN, then GL_TOKEN, then glab's own.
+gl_token() {
+  if [ -n "${GITLAB_TOKEN:-}" ]; then printf '%s' "$GITLAB_TOKEN"; return 0; fi
+  if [ -n "${GL_TOKEN:-}" ]; then printf '%s' "$GL_TOKEN"; return 0; fi
+  local tok
+  tok=$(glab auth status --show-token --hostname "$GL_HOST" 2>&1 \
+        | sed -n 's/.*Token[^:]*: *\([^ ]*\).*/\1/p' | head -n 1) || true
+  if [ -z "$tok" ] || [[ "$tok" =~ ^\*+$ ]]; then return 1; fi
+  printf '%s' "$tok"
+}
+
+# git with the GitLab token and no password prompt. The empty helper first
+# clears any other helper; the token travels only in this process's env.
+ggit() {
+  GIT_TERMINAL_PROMPT=0 GLREPO_TOKEN="$GLREPO_TOKEN" git \
+    -c "credential.https://$GL_HOST.helper=" \
+    -c "credential.https://$GL_HOST.helper=!f() { test \"\$1\" = get || return 0; echo username=oauth2; echo \"password=\$GLREPO_TOKEN\"; }; f" \
+    "$@"
+}
+
+is_path() { [[ "$1" =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)+$ ]]; }
+is_name() { [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]]; }
+is_ns()   { [[ "$1" =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ ]]; }
+
+# Prints a project's JSON, or fails if it doesn't exist.
+project_json() {
+  local json
+  json=$(gl_api "projects/$(urlenc "$1")" 2>/dev/null) || return 1
+  [ -n "$(jq -r '.id // empty' <<< "$json" 2>/dev/null)" ] || return 1
+  printf '%s\n' "$json"
+}
+
+project_exists() { project_json "$1" >/dev/null; }
+
+# Prints the id of a group, subgroup or user namespace, or fails.
+namespace_id() {
+  local json id
+  json=$(gl_api "namespaces/$(urlenc "$1")" 2>/dev/null) || return 1
+  id=$(jq -r '.id // empty' <<< "$json" 2>/dev/null) || return 1
+  [ -n "$id" ] || return 1
+  printf '%s\n' "$id"
+}
+
+# Prints "missing", "empty" or "has-data" for a project path.
+project_state() {
+  local json
+  if ! json=$(project_json "$1"); then echo missing
+  elif [ "$(jq -r '.empty_repo' <<< "$json")" = "true" ]; then echo empty
+  else echo has-data; fi
+}
+
+# True when every branch and tag at the URL points to a commit in the mirror.
+is_partial_copy() {
+  local dir="$1" url="$2" refs sha rest
+  refs=$(ggit ls-remote --heads --tags "$url") || return 1
+  while read -r sha rest; do
+    [ -n "$sha" ] || continue
+    git -C "$dir" cat-file -e "${sha}^{commit}" 2>/dev/null || return 1
+  done <<< "$refs"
+}
+
+# "group/sub/{a,b}" or "group/sub/a,b" -> group/sub/a group/sub/b.
+# Anything without a slash is passed through so the caller can report it.
+expand_sources() {
+  local s prefix list item
+  local -a parts
+  for s in "$@"; do
+    if [[ "$s" != */* ]]; then echo "$s"; continue; fi
+    prefix="${s%/*}"
+    list="${s##*/}"
+    list="${list#\{}"
+    list="${list%\}}"
+    IFS=',' read -ra parts <<< "$list"
+    for item in "${parts[@]}"; do
+      item="${item// /}"
+      [ -n "$item" ] && echo "$prefix/$item"
+    done
+  done
+}
+
+# ---------- commands ----------
+
+cmd_copy() {
+  wants_help "$@" && { usage_copy; exit 0; }
+  [ "$#" -ge 2 ] || { usage_copy >&2; exit 1; }
+  check_tools
+  GLREPO_TOKEN=$(gl_token) || die "couldn't read your GitLab token for $GL_HOST.
+       Run: glab auth login    or set GITLAB_TOKEN"
+
+  local dst="${!#}" dst_ns new_name="" ns_id
+  local -a sources
+  mapfile -t sources < <(expand_sources "${@:1:$#-1}")
+  [ "${#sources[@]}" -gt 0 ] || die "no source projects given"
+  is_ns "$dst" || die "'$dst' must look like group, group/sub or group/new-name"
+
+  if ns_id=$(namespace_id "$dst"); then
+    dst_ns="$dst"
+  else
+    [[ "$dst" == */* ]] || die "group '$dst' not found on $GL_HOST, or no access"
+    [ "${#sources[@]}" -eq 1 ] \
+      || die "with several sources, the destination must be an existing group"
+    dst_ns="${dst%/*}"
+    new_name="${dst##*/}"
+    ns_id=$(namespace_id "$dst_ns") || die "group '$dst_ns' not found on $GL_HOST, or no access"
+  fi
+
+  local src name target url json vis state tmp ok=0 skipped=0 failed=0
+  for src in "${sources[@]}"; do
+    if ! is_path "$src"; then skip "'$src' is not a valid group/project"; skipped=$((skipped+1)); continue; fi
+    name="${new_name:-${src##*/}}"
+    target="$dst_ns/$name"
+    url="https://$GL_HOST/$target.git"
+    if [ "$src" = "$target" ]; then skip "$src: source and destination are the same"; skipped=$((skipped+1)); continue; fi
+
+    if ! json=$(project_json "$src"); then
+      skip "$src not found, or no access"; skipped=$((skipped+1)); continue
+    fi
+    vis=$(jq -r '.visibility' <<< "$json")
+
+    tmp=$(mktemp -d)
+    if ! ggit clone --quiet --mirror "https://$GL_HOST/$src.git" "$tmp/repo.git"; then
+      fail "could not clone $src"; failed=$((failed+1)); rm -rf "$tmp"; continue
+    fi
+
+    state=$(project_state "$target")
+    case "$state" in
+      missing)
+        info "Copying $src to $target (new $vis project)"
+        if ! gl_api -X POST projects -f name="$name" -f path="$name" \
+               -f namespace_id="$ns_id" -f visibility="$vis" >/dev/null; then
+          fail "could not create $target"; failed=$((failed+1)); rm -rf "$tmp"; continue
+        fi ;;
+      empty)
+        info "Copying $src to $target (reusing existing empty project)" ;;
+      has-data)
+        if is_partial_copy "$tmp/repo.git" "$url"; then
+          info "Resuming $src to $target (it holds an earlier or partial copy)"
+        else
+          skip "$target has commits that aren't in $src; not touching it"
+          skipped=$((skipped+1)); rm -rf "$tmp"; continue
+        fi ;;
+    esac
+
+    if ggit -C "$tmp/repo.git" push --quiet -o ci.skip "$url" \
+         'refs/heads/*:refs/heads/*' 'refs/tags/*:refs/tags/*'; then
+      ok=$((ok+1))
+    else
+      fail "$src: push failed. Fix the error above, then re-run to resume."
+      failed=$((failed+1))
+    fi
+    rm -rf "$tmp"
+  done
+  info "Finished: $ok copied, $skipped skipped, $failed failed"
+  [ "$failed" -eq 0 ]
+}
+
+cmd_archive() {
+  wants_help "$@" && { usage_archive; exit 0; }
+  [ "$#" -ge 1 ] || { usage_archive >&2; exit 1; }
+  check_tools
+
+  local -a projects
+  mapfile -t projects < <(expand_sources "$@")
+
+  local p json ok=0 skipped=0 failed=0
+  for p in "${projects[@]}"; do
+    if ! is_path "$p"; then skip "'$p' is not a valid group/project"; skipped=$((skipped+1)); continue; fi
+    if ! json=$(project_json "$p"); then skip "$p not found, or no access"; skipped=$((skipped+1)); continue; fi
+    if [ "$(jq -r '.archived' <<< "$json")" = "true" ]; then skip "$p is already archived"; skipped=$((skipped+1)); continue; fi
+
+    if gl_api -X POST "projects/$(urlenc "$p")/archive" >/dev/null; then
+      info "Archived $p"; ok=$((ok+1))
+    else
+      fail "could not archive $p"; failed=$((failed+1))
+    fi
+  done
+  info "Finished: $ok archived, $skipped skipped, $failed failed"
+  [ "$failed" -eq 0 ]
+}
+
+cmd_transfer() {
+  wants_help "$@" && { usage_transfer; exit 0; }
+  [ "$#" -ge 2 ] || { usage_transfer >&2; exit 1; }
+  check_tools
+
+  local dst_group="${!#}"
+  is_ns "$dst_group" || die "'$dst_group' must be a group path, for example archive-group"
+  namespace_id "$dst_group" >/dev/null || die "group '$dst_group' not found on $GL_HOST, or no access"
+
+  local -a sources
+  mapfile -t sources < <(expand_sources "${@:1:$#-1}")
+
+  local src name ok=0 skipped=0 failed=0
+  for src in "${sources[@]}"; do
+    if ! is_path "$src"; then skip "'$src' is not a valid group/project"; skipped=$((skipped+1)); continue; fi
+    name="${src##*/}"
+    if [ "${src%/*}" = "$dst_group" ]; then skip "$src is already in $dst_group"; skipped=$((skipped+1)); continue; fi
+    if ! project_exists "$src"; then skip "$src not found, or no access"; skipped=$((skipped+1)); continue; fi
+    if project_exists "$dst_group/$name"; then skip "$dst_group/$name already exists"; skipped=$((skipped+1)); continue; fi
+
+    info "Transferring $src to $dst_group"
+    if gl_api -X PUT "projects/$(urlenc "$src")/transfer" -f namespace="$dst_group" >/dev/null; then
+      info "Now at $dst_group/$name"; ok=$((ok+1))
+    else
+      fail "could not transfer $src"; failed=$((failed+1))
+    fi
+  done
+  info "Finished: $ok transferred, $skipped skipped, $failed failed"
+  [ "$failed" -eq 0 ]
+}
+
+cmd_rename() {
+  wants_help "$@" && { usage_rename; exit 0; }
+  [ "$#" -eq 2 ] || { usage_rename >&2; exit 1; }
+  check_tools
+
+  local src="$1" new="$2"
+  is_path "$src" || die "'$src' must look like group/project"
+  [[ "$new" != */* ]] || die "new name only, no group. To change group, use transfer."
+  is_name "$new" || die "'$new' can use only letters, digits, dot, dash, underscore"
+
+  local group="${src%/*}"
+  [ "${src##*/}" != "$new" ] || die "new name is the same as the old one"
+  project_exists "$src" || die "$src not found, or you don't have access"
+  project_exists "$group/$new" && die "$group/$new already exists. Nothing changed."
+
+  info "Renaming $src to $group/$new"
+  gl_api -X PUT "projects/$(urlenc "$src")" -f name="$new" -f path="$new" >/dev/null \
+    || die "rename failed"
+  info "Done: now at $group/$new"
+  echo "    Update local clones: git remote set-url origin https://$GL_HOST/$group/$new.git"
+}
+
+# ---------- entry point ----------
+
+sub="${1:-}"
+[ "$#" -gt 0 ] && shift
+
+case "$sub" in
+  copy)          cmd_copy "$@" ;;
+  archive)       cmd_archive "$@" ;;
+  transfer)      cmd_transfer "$@" ;;
+  rename)        cmd_rename "$@" ;;
+  -h|--help|"")  usage_main ;;
+  -v|--version)  echo "$PROG $VERSION" ;;
+  *)             echo "Unknown command: $sub" >&2; echo >&2; usage_main >&2; exit 1 ;;
+esac

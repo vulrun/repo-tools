@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+# Fake glab for the tests. Only the calls glrepo makes are supported.
+# A group is a folder under $STUB_STATE/gitlab with a .group file holding
+# its id. A project is a bare repo <path>.git with metadata in <path>.meta.
+# STUB_GL_TOKEN sets the token "glab auth status --show-token" reports.
+set -euo pipefail
+
+S="$STUB_STATE/gitlab"
+urldec()    { printf '%b' "${1//%/\\x}"; }
+repo_dir()  { echo "$S/$1.git"; }
+meta_file() { echo "$S/$1.meta"; }
+get_meta()  { sed -n "s/^$2=//p" "$(meta_file "$1")"; }
+set_meta() {
+  local f; f="$(meta_file "$1")"
+  { grep -v "^$2=" "$f" || true; echo "$2=$3"; } > "$f.tmp"
+  mv "$f.tmp" "$f"
+}
+not_found() { echo "glab: 404 Not Found (HTTP 404)" >&2; exit 1; }
+
+# Bare repo that accepts push options and logs them, like GitLab does.
+init_project() {
+  local d; d="$(repo_dir "$1")"
+  git init -q --bare "$d"
+  git -C "$d" config receive.advertisePushOptions true
+  cat > "$d/hooks/pre-receive" <<'HOOK'
+#!/usr/bin/env bash
+i=0
+while [ "$i" -lt "${GIT_PUSH_OPTION_COUNT:-0}" ]; do
+  v="GIT_PUSH_OPTION_$i"; echo "${!v}" >> "$STUB_STATE/pushopts.log"; i=$((i+1))
+done
+cat > /dev/null
+HOOK
+  chmod +x "$d/hooks/pre-receive"
+  printf 'id=%s\nvis=%s\narchived=false\n' "$RANDOM" "$2" > "$(meta_file "$1")"
+}
+
+move_project() {   # move_project <from> <to>
+  [ -f "$S/${2%/*}/.group" ] || { echo "glab: namespace ${2%/*} not found" >&2; exit 1; }
+  [ ! -e "$(repo_dir "$2")" ] || { echo "glab: $2 has already been taken" >&2; exit 1; }
+  mv "$(repo_dir "$1")" "$(repo_dir "$2")"
+  mv "$(meta_file "$1")" "$(meta_file "$2")"
+}
+
+echo "glab $*" >> "$STUB_STATE/calls.log"
+
+if [ "${1:-}" = auth ] && [ "${2:-}" = status ]; then
+  echo "gitlab.test"
+  echo "  ✓ Logged in to gitlab.test as tester"
+  for a in "$@"; do
+    if [ "$a" = --show-token ] && [ -n "${STUB_GL_TOKEN-glpat-test}" ]; then
+      echo "  ✓ Token found: ${STUB_GL_TOKEN-glpat-test}"
+    fi
+  done
+  exit 0
+fi
+
+[ "${1:-}" = api ] || { echo "stub: unsupported glab call: $*" >&2; exit 2; }
+shift
+
+method=GET; ep=""
+declare -A F=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --hostname)      shift 2 ;;
+    -X|--method)     method="$2"; shift 2 ;;
+    -f|--raw-field)  F["${2%%=*}"]="${2#*=}"; shift 2 ;;
+    *)               ep="$1"; shift ;;
+  esac
+done
+
+case "$method $ep" in
+  "GET namespaces/"*)
+    p="$(urldec "${ep#namespaces/}")"
+    [ -f "$S/$p/.group" ] || not_found
+    printf '{"id": %s, "full_path": "%s", "kind": "group"}\n' "$(cat "$S/$p/.group")" "$p"
+    ;;
+
+  "GET projects/"*)
+    p="$(urldec "${ep#projects/}")"
+    [ -d "$(repo_dir "$p")" ] || not_found
+    empty=false
+    [ -n "$(git -C "$(repo_dir "$p")" for-each-ref)" ] || empty=true
+    printf '{"id": %s, "path_with_namespace": "%s", "visibility": "%s", "empty_repo": %s, "archived": %s}\n' \
+      "$(get_meta "$p" id)" "$p" "$(get_meta "$p" vis)" "$empty" "$(get_meta "$p" archived)"
+    ;;
+
+  "POST projects")
+    gfile="$(grep -rlx --include=.group "${F[namespace_id]}" "$S" | head -n 1)" || true
+    [ -n "$gfile" ] || { echo "glab: namespace not found" >&2; exit 1; }
+    g="$(dirname "$gfile")"; g="${g#"$S"/}"
+    p="$g/${F[path]}"
+    [ ! -e "$(repo_dir "$p")" ] || { echo "glab: path has already been taken" >&2; exit 1; }
+    init_project "$p" "${F[visibility]}"
+    echo "{\"id\": 1, \"path_with_namespace\": \"$p\"}"
+    ;;
+
+  "POST projects/"*/archive)
+    p="$(urldec "${ep#projects/}")"; p="${p%/archive}"
+    [ -d "$(repo_dir "$p")" ] || not_found
+    set_meta "$p" archived true
+    echo "{}"
+    ;;
+
+  "PUT projects/"*/transfer)
+    p="$(urldec "${ep#projects/}")"; p="${p%/transfer}"
+    [ -d "$(repo_dir "$p")" ] || not_found
+    move_project "$p" "${F[namespace]}/${p##*/}"
+    echo "{}"
+    ;;
+
+  "PUT projects/"*)
+    p="$(urldec "${ep#projects/}")"
+    [ -d "$(repo_dir "$p")" ] || not_found
+    move_project "$p" "${p%/*}/${F[path]}"
+    echo "{}"
+    ;;
+
+  *)
+    echo "stub: unsupported api call $method $ep" >&2
+    exit 2
+    ;;
+esac
